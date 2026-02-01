@@ -1,35 +1,83 @@
 """
-Text Processing Utilities for Jira RAG
+================================================================================
+TUTORIAL: Text Processing Utilities for Jira RAG
+================================================================================
 
-Clean and normalise text before it's embedded.
+WHY TEXT UTILS?
+---------------
+Raw Jira data is messy:
+  - Inconsistent whitespace
+  - Account IDs that leak PII
+  - Image/attachment references that add noise
+  - Varying formats for links
+
+These utilities clean and normalize text before it's embedded.
+Clean text → Better embeddings → Better retrieval → Better generation.
 
 LANGCHAIN RELEVANCE:
 --------------------
 While LangChain has text splitters, it doesn't do content-aware cleaning.
 We apply these utilities BEFORE passing text to LangChain components.
+
+================================================================================
 """
 
 import re
 from typing import Optional
 
-#Whitespace normalisation
 
-def normalize_whitespace(text:str) -> str:
+# =============================================================================
+# SECTION 1: WHITESPACE NORMALIZATION
+# =============================================================================
+
+
+def normalize_whitespace(text: str) -> str:
     """
+    Normalize whitespace in text for consistent processing.
+    
+    WHY THIS MATTERS:
+    -----------------
+    Jira exports have inconsistent whitespace:
+      - Windows line endings (\\r\\n)
+      - Multiple spaces from copy-paste
+      - Excessive blank lines
+    
+    Consistent whitespace means:
+      - Consistent token counts
+      - Better embedding similarity
+      - Cleaner display
+    
+    OPERATIONS:
     1. Convert all line endings to \\n
     2. Collapse multiple spaces/tabs to single space
     3. Collapse 3+ newlines to double newline (preserve paragraphs)
     4. Strip leading/trailing whitespace
+    
+    Args:
+        text: Raw text to normalize
+        
+    Returns:
+        Normalized text
+    
+    Example:
+        >>> normalize_whitespace("Hello  \\r\\n\\r\\n\\r\\nWorld")
+        'Hello\\n\\nWorld'
     """
-    text = text.replace("\r\n","\n").replace("\r", "\n")
-
+    # Convert line endings
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    
     # Collapse horizontal whitespace (spaces, tabs)
     text = re.sub(r"[ \t]+", " ", text)
-
+    
     # Collapse excessive blank lines (keep paragraph breaks)
     text = re.sub(r"\n{3,}", "\n\n", text)
     
     return text.strip()
+
+
+# =============================================================================
+# SECTION 2: JIRA-SPECIFIC CLEANING
+# =============================================================================
 
 # Compiled regex patterns for efficiency (compiled once, used many times)
 _ACCOUNT_ID_PATTERN = re.compile(r"\[~accountid:[^\]]+\]")
@@ -37,10 +85,13 @@ _IMAGE_PATTERN = re.compile(r"!\S+?\|[^!]*!")
 _SMART_LINK_PATTERN = re.compile(r"\|smart-link\]", re.IGNORECASE)
 _ATTACHMENT_PATTERN = re.compile(r"\[(\^[^\]]+)\]")
 
+
 def redact_jira_tokens(text: str) -> str:
     """
     Remove or redact Jira-specific tokens that add noise.
     
+    WHAT WE CLEAN:
+    --------------
     1. Account IDs: [~accountid:abc123] → @user
        - Jira exports contain internal account IDs
        - These leak PII and add no semantic value
@@ -82,6 +133,11 @@ def redact_jira_tokens(text: str) -> str:
     return text
 
 
+# =============================================================================
+# SECTION 3: STRUCTURED TEXT BUILDING
+# =============================================================================
+
+
 def build_issue_text(
     *,  # Keyword-only arguments for clarity
     summary: str,
@@ -91,13 +147,8 @@ def build_issue_text(
     include_labels: bool = False,
     labels: Optional[list[str]] = None,
 ) -> str:
-     """
+    """
     Build structured text from Jira issue fields.
-    
-    WHY STRUCTURED FORMAT?
-    ----------------------
-    Just concatenating fields loses structure:
-        "Fix bug We need to check... - [ ] Works in DEV"
     
     With structure, the model understands field boundaries:
         "Summary: Fix bug
@@ -127,39 +178,50 @@ def build_issue_text(
         ... )
         'Summary:\\nConfigure auth\\n\\n---\\n\\nDescription:\\nSet up OAuth...'
     """
-     parts:list[str] =[]
-     parts.append(f"Summary:\n{summary.strip()}")
-
-     if description and description.strip():
-         cleaned_desc = redact_jira_tokens(description.strip())
-         if cleaned_desc:
-             parts.append(f"Description:\n{cleaned_desc}")
-
-     if acceptance_criteria  and acceptance_criteria .strip():
-         cleaned_ac = redact_jira_tokens(acceptance_criteria .strip())
-         if cleaned_ac:
-             parts.append(f"Acceptance Criteria :\n{cleaned_ac}")
-     if comments:
-         cleaned_comments = []
-         for comment in comments[:15]: #Only picking the most recent 15 comments
-             if comment and comment.strip():
-                 cleaned = redact_jira_tokens(comment.strip())
-                 if cleaned:
-                     cleaned_comments.append(cleaned)
-
-         if cleaned_comments:
+    parts: list[str] = []
+    
+    # Summary is always included
+    parts.append(f"Summary:\n{summary.strip()}")
+    
+    # Description (if present and non-empty)
+    if description and description.strip():
+        cleaned_desc = redact_jira_tokens(description.strip())
+        if cleaned_desc:
+            parts.append(f"Description:\n{cleaned_desc}")
+    
+    # Acceptance Criteria (if present)
+    if acceptance_criteria and acceptance_criteria.strip():
+        cleaned_ac = redact_jira_tokens(acceptance_criteria.strip())
+        if cleaned_ac:
+            parts.append(f"Acceptance Criteria:\n{cleaned_ac}")
+    
+    # Comments (limited to most recent for relevance)
+    if comments:
+        cleaned_comments = []
+        for comment in comments[:15]:  # Limit to 15 most recent
+            if comment and comment.strip():
+                cleaned = redact_jira_tokens(comment.strip())
+                if cleaned:
+                    cleaned_comments.append(cleaned)
+        
+        if cleaned_comments:
             joined = "\n---\n".join(cleaned_comments)
             parts.append(f"Comments:\n{joined}")
-
-     if include_labels and labels:
-         label_str = ", ".join(labels)
-         parts.append(f"Labels {label_str}")
-
+    
+    # Labels (optional)
+    if include_labels and labels:
+        label_str = ", ".join(labels)
+        parts.append(f"Labels: {label_str}")
+    
     # Join with section dividers and normalize
-     return normalize_whitespace("\n\n---\n\n".join(parts))
-        
+    return normalize_whitespace("\n\n---\n\n".join(parts))
 
-#Context formatting
+
+# =============================================================================
+# SECTION 4: CONTEXT FORMATTING
+# =============================================================================
+
+
 def format_retrieved_context(
     chunks: list,
     include_metadata: bool = True,
@@ -188,27 +250,30 @@ def format_retrieved_context(
     """
     if not chunks:
         return "No relevant historical tickets found."
+    
     # Limit chunks if specified
     if max_chunks:
         chunks = chunks[:max_chunks]
     
-    lines:list[str] = ["## Retrieved Historical Tickets (Top Matches)\n"]
-
-    for rank,chunk in enumerate(chunk,start=1):
-        #get meta
+    lines: list[str] = ["## Retrieved Historical Tickets (Top Matches)\n"]
+    
+    for rank, chunk in enumerate(chunks, start=1):
+        # Get metadata (handle both dict and object access)
         if hasattr(chunk, 'metadata'):
             meta = chunk.metadata
         elif hasattr(chunk, 'meta_data'):
             meta = chunk.meta_data
         else:
             meta = {}
-
+        
+        # Get text content
         if hasattr(chunk, 'text'):
             text = chunk.text
         elif hasattr(chunk, 'page_content'):
             text = chunk.page_content
         else:
             text = str(chunk)
+        
         # Build header
         if include_metadata:
             issue_key = meta.get("issue_key", "UNKNOWN")
@@ -226,6 +291,12 @@ def format_retrieved_context(
         lines.append(f"\n{header}\n{text.strip()}\n")
     
     return "\n".join(lines)
+
+
+# =============================================================================
+# SECTION 5: LINK EXTRACTION
+# =============================================================================
+
 
 def extract_jira_links(text: str) -> list[dict[str, str]]:
     """
@@ -319,3 +390,27 @@ def format_context_with_links(
                 seen_urls.add(link["url"])
     
     return "\n".join(lines)
+
+
+# =============================================================================
+# TUTORIAL REVIEW
+# =============================================================================
+#
+# WHAT YOU LEARNED:
+# 1. Text normalization for consistent processing
+# 2. Jira-specific cleaning (redacting PII, removing noise)
+# 3. Structured text building for better embeddings
+# 4. Context formatting for LLM consumption
+# 5. Link extraction and preservation
+#
+# QUALITY IMPACT:
+# - Clean text → Better embeddings → Better retrieval
+# - Structured format → Model understands field boundaries
+# - Link preservation → Generated tickets maintain references
+#
+# INTERVIEW TALKING POINTS:
+# - "Text preprocessing is often overlooked but critical for RAG quality"
+# - "Jira exports have PII (account IDs) that we redact"
+# - "Explicit link extraction improves preservation in generation"
+#
+# =============================================================================

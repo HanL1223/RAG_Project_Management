@@ -1,4 +1,6 @@
 """
+WHAT ARE DOCUMENT LOADERS?
+--------------------------
 LangChain Document Loaders convert various data sources into Document objects.
 Built-in loaders exist for PDFs, web pages, databases, etc.
 
@@ -20,9 +22,9 @@ WHY CUSTOM LOADERS?
 - Our data has specific structure (issue_key, description, etc.)
 - We apply domain-specific text processing
 - We attach rich metadata for filtering and display
+
 """
 
-import csv
 import csv
 import json
 import logging
@@ -38,48 +40,157 @@ from src.core.text_utils import build_issue_text
 logger = logging.getLogger(__name__)
 
 
+
+#Base Loader Interface
+
 class JiraIssueLoader(ABC):
-    """
-    Abstract base class for Jira issue loaders.
     
-    The load() method is implemented in terms of lazy_load(),
-    so subclasses only need to implement lazy_load().
-    
-    This follows the same pattern as LangChain's BaseLoader,
-    """
-    def lazy_load(self) ->Iterator[Document]:
-            
-            """
-            Lazily load documents one at a time.
-        
-        This is a generator that yields Document objects.
-        Memory efficient for large datasets.
-        
-        Yields:
-            LangChain Document objects
-            """
-            raise NotImplementedError
-    def load(self)->list[Document]:
-          """
-        Load all document into memory
-        method  collects all documents from lazy_load().
-        Use lazy_load() for large datasets to avoid memory issues.
-
-        Returns:
-            List of all Document objects
-
-          """
-          return list(self.lazy_load())
-class JiraJsonlLoader(JiraIssueLoader):
-    def __init__(self,
-                   path: Path| str,
-                   max_issues:Optional[int] = None,
-                   include_comments:bool =True):
-            self.path = path
-            self.max_issues = max_issues
-            self.include_comments = include_comments
-            if not self.path.exists():
-                  raise FileNotFoundError(f"Jsonl file ot found in {self.path}")
+    @abstractmethod
     def lazy_load(self) -> Iterator[Document]:
-          issue_count = 0
-          
+        raise NotImplementedError
+    def load(self) ->list[Document]:
+        return list(self.lazy_load())
+
+
+class JiraJsonlLoader(JiraIssueLoader):
+    def __init__ (
+            self,
+            path: Path | str,
+            max_issues:Optional[int] = None,
+            include_comments:bool = True,
+    ):
+        if not self.path.exists():
+            raise FileNotFoundError(f"JSONL file not fond at {self.path}")
+    def lazy_load(self)-> Iterator[Document]:
+        issue_count = 0
+        with self.path.open('r',encoding = 'utf-8') as f:
+            for line_num,line in enumerate(f,start=1):
+                if self.max_issues and issue_count >= self.max_issues:
+                    logger.info(f"Reach max issue limit {self.max_issues}")
+                    break
+                line = line.strip() 
+                if not line:
+                    continue
+                try:
+                    #Parse Json
+                    data = json.loads(line)
+
+                    #Crete domain model
+                    issue = JiraIssue.from_dict(data)
+
+                    #Skipping invalid issues (no issue key or summary)
+                    if not issue.issue_key or not issue.summary:
+                        logger.warning(f"Skipping line {line_num}: missing issue key or summary")
+                        continue
+                    
+                    text = build_issue_text(
+                        summary=issue.summary,
+                        description=issue.description,
+                        acceptance_criteria=issue.acceptance_criteria,
+                        comments=issue.comments if self.include_comments else None,
+                    )
+
+                    doc = issue.to_langchain_document(text)
+                    issue_count += 1
+                    yield doc
+                except JiraJsonlLoader as e:
+                    logger.warning(f"Invalid JSON at line {line_num}: {e}")
+                except Exception as e:
+                    logger.warning(f"Error processing line {line_num}, {e}")
+        logger.info(f"Loaded {issue_count} issue from {self.path}")
+
+#CSV loaded
+
+
+class JiraCsvLoader(JiraIssueLoader):
+    def __init__(self,
+                 path: Path | str,
+                 max_issues: Optional[int] = None,
+                 include_comments :bool = True
+                 ):
+        if not self.path.exists():
+            raise FileNotFoundError(f"CSV not found at {self.path}")
+    def _extract_comments(self,row:dict) -> list[str]:
+        comments = []
+        for key,value in row.items():
+            if not key:
+                continue
+            if key.lower().startwith("comment") and value:
+                value = str(value).strip()
+                if value:
+                    # Extract body from format like "date;author..."
+                    parts = value.spliot(';',2)
+                    if len(parts) == 3:
+                        body = parts[2].strip()
+                    else:
+                        body = value
+                    if body:
+                        comments.append(body)
+        return comments
+    
+    def lazy_load(self) -> Iterator[Document]:
+        issue_count = 0
+
+        with self.path.open('r',encoding = 'utf-8-sig',newline = "") as f:
+            reader = csv.DictReader(f)
+
+            for row_num,row in enumerate(reader,start=1):
+                if self.max_issues and issue_count >= self.max_issues:
+                    break
+                try:
+                    issue = JiraIssue.from_dict(row)
+                    if not issue.issue_key or issue.summary:
+                        logger.warnning(
+                            f"Skipping row {row_num}: missing issue key or summary"
+                        )
+                        continue
+                    comments = None
+                    if self.include_comments:
+                        comments = self._extract_comments(row)
+                    text = build_issue_text(
+                        summary=issue.summary,
+                        description=issue.description,
+                        acceptance_criteria=issue.acceptance_criteria,
+                        comments=issue.comments if self.include_comments else None,
+                    )
+                    doc = issue.to_langchain_document(text)
+                    issue_count += 1
+                    yield doc
+                except Exception as e:
+                    logger.warning(f"Error processing row {row_num}: {e}")
+            logger.info(f"Loaded {issue_count} issues from {self.path}")
+
+#Factory function
+
+def create_loader(
+        path: Path | str,
+        max_issues:Optional[int] = None,
+        include_comments:bool = True,
+) -> JiraIssueLoader:
+    path = Path(path)
+    extension = path.suffix.lower()
+    if extension in {".jsonl", ".jsonlines"}:
+        return JiraJsonlLoader(
+            path = path,
+            max_issues=max_issues,
+            include_comments= include_comments
+        )
+    
+    if extension == '.csv':
+        return JiraCsvLoader(
+          path = path,
+          max_issues=max_issues,
+          include_comments= include_comments 
+        )
+    #To add more loadding method as needed
+    raise ValueError(
+        f"Unsupported file extension: {extension}. "
+        f"Supported: .jsonl, .jsonlines, .csv"
+    )
+                
+    
+
+
+        
+        
+    
